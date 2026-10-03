@@ -1,5 +1,6 @@
 import { UserRepository } from "../modules/user/user.repository.js";
 import { UserService } from "../modules/user/user.service.js";
+import type { UserFilterInput, UserSortInput, UserPaginationInput } from "../modules/user/user.schema.js";
 import type { GraphQLContext } from "./context.js";
 
 const userRepository = new UserRepository();
@@ -27,6 +28,28 @@ export const resolvers = {
       }
 
       return user;
+    },
+
+    user: async (
+      _parent: unknown,
+      args: { id: string }
+    ) => {
+      return userService.getById(args.id);
+    },
+
+    users: async (
+      _parent: unknown,
+      args: {
+        filter?: UserFilterInput;
+        sort?: UserSortInput;
+        pagination?: UserPaginationInput;
+      }
+    ) => {
+      return userService.getMany(
+        args.filter ?? {},
+        args.sort,
+        args.pagination
+      );
     },
   },
 
