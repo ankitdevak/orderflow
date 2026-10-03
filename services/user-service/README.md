@@ -1,22 +1,23 @@
 # User Service
 
-The User Service is the implemented identity/account component described for OrderFlow. It provides a GraphQL API for registration, login, and retrieving the currently authenticated user. The described stack is Node.js, TypeScript, Express, Apollo Server, Prisma, PostgreSQL, Zod, bcrypt, and JWT.
+The User Service is OrderFlow's identity and account component. It exposes a GraphQL API for registration, login, retrieving the authenticated user, looking up a user by ID, and listing users with filtering, sorting, and cursor-based pagination.
 
-> **Workspace note:** The service checkout was not available when this file was prepared. The architecture and behavior below come from the referenced conversation. Confirm exact source filenames, schema fields, package scripts, and response types in the project before relying on them as a source of truth.
+Stack: Node.js, TypeScript, Express 5, Apollo Server 5, Prisma 6, PostgreSQL 16, Zod, bcrypt, and JSON Web Tokens.
 
 ## Status
 
 | Capability | Status |
 |---|---|
-| Register user | Implemented in the referenced work |
-| Login and issue access token | Implemented in the referenced work |
-| JWT authentication context | Implemented in the referenced work |
-| Protected `me` query | Implemented in the referenced work |
-| PostgreSQL/Prisma persistence | Described as configured; migration files could not be inspected |
-| Tests | Planned/unverified |
+| Register user | Implemented |
+| Login and issue access token | Implemented |
+| JWT authentication context | Implemented |
+| Protected `me` query | Implemented |
+| `user(id)` lookup | Implemented |
+| `users` list with filter, sort, and cursor pagination | Implemented |
+| PostgreSQL/Prisma persistence | Implemented (`create_user` migration) |
+| Authorization on `user` / `users` | Not yet implemented, see [Security](#security-and-operational-guidance) |
+| Tests | Planned |
 | Product/Order integration | Planned |
-
-Product Service, Order Service, Gateway, automated tests, and future cross-service integration should be treated as planned unless confirmed in the checkout.
 
 ## Request flow
 
@@ -27,23 +28,30 @@ sequenceDiagram
     participant X as Auth context
     participant R as Resolver
     participant S as User service
-    participant P as Prisma/repository
+    participant P as User repository
     participant D as PostgreSQL
     C->>G: GraphQL operation + optional Bearer token
     G->>X: Build request context
     X->>X: Verify JWT when supplied
     G->>R: Dispatch operation
-    R->>S: Validate/use business operation
+    R->>S: Validate input (Zod) and run business logic
     S->>P: Read or write user data
     P->>D: SQL via Prisma
     D-->>C: Selected GraphQL result
 ```
 
-Registration hashes the password before persistence. Login checks the submitted password against the stored hash and issues a signed access token. For `me`, the request context verifies the token and exposes the authenticated user identity to the resolver/service.
+Registration hashes the password before it is stored. Login compares the submitted password with the stored hash and issues a signed access token. The request context (`src/graphql/context.ts`) reads `Authorization: Bearer <token>`. If the token is valid, it exposes `{ userId, role }` as `context.user`. If the token is missing or invalid, `context.user` is `null`.
+
+## Endpoints
+
+| Path | Description |
+|---|---|
+| `POST /graphql` | GraphQL API (Apollo Server) |
+| `GET /health` | HTTP health check, returns `{ "service": "user-service", "status": "ok" }` |
+
+The default port is `4001`.
 
 ## API operations
-
-The referenced implementation describes `register`, `login`, and `me`. These examples use likely argument and return names; validate them against the checked-out GraphQL schema.
 
 ### Register
 
@@ -53,28 +61,30 @@ mutation Register($name: String!, $email: String!, $password: String!) {
     id
     name
     email
+    role
   }
 }
 ```
 
-The registration path validates input with Zod, hashes the password with bcrypt, and stores the user through the repository/Prisma layer. The exact password policy, duplicate-email behavior, and selected fields require source verification.
+Validation rules: `name` must be 2–100 characters (trimmed), `email` must be a valid email address, and `password` must be 8–100 characters. New users get the `CUSTOMER` role.
 
 ### Login
 
 ```graphql
 mutation Login($email: String!, $password: String!) {
   login(email: $email, password: $password) {
-    accessToken
+    token
     user {
       id
       name
       email
+      role
     }
   }
 }
 ```
 
-The conversation describes a one-hour token lifetime in the JWT helper. It also shows a `JWT_EXPIRES_IN` environment value, but the helper shown uses a literal `"1h"`; verify whether the current source actually reads the environment variable.
+Tokens carry `userId` and `role` (`CUSTOMER` or `ADMIN`) and expire after **1 hour**. The expiry is hard-coded in `user.auth.ts`, which does not read `JWT_EXPIRES_IN`.
 
 ### Current user
 
@@ -89,84 +99,180 @@ query Me {
 }
 ```
 
-Include the access token as an HTTP header:
+This query requires the header:
 
 ```http
-Authorization: Bearer <access-token>
+Authorization: Bearer <token>
 ```
 
-The described token claims contain `userId` and a role of `CUSTOMER` or `ADMIN`. The `me` field is intended to require authentication. Exact GraphQL schema types and error behavior are unverified.
+Without a valid token, it returns the error `Authentication required`.
+
+### User by ID
+
+```graphql
+query User($id: ID!) {
+  user(id: $id) {
+    id
+    name
+    email
+    role
+    createdAt
+  }
+}
+```
+
+Returns the error `User not found` if no user has that ID.
+
+### List users
+
+```graphql
+query Users(
+  $filter: UserFilterInput
+  $sort: UserSortInput
+  $pagination: UserPaginationInput
+) {
+  users(filter: $filter, sort: $sort, pagination: $pagination) {
+    items {
+      id
+      name
+      email
+      role
+      createdAt
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    total
+  }
+}
+```
+
+Example variables:
+
+```json
+{
+  "filter": { "role": "CUSTOMER", "name": "ank" },
+  "sort": { "field": "NAME", "direction": "ASC" },
+  "pagination": { "first": 10 }
+}
+```
+
+**Filter** (`UserFilterInput`). All fields are optional and are combined with AND.
+
+| Field | Match |
+|---|---|
+| `id` | Exact match; must be a UUID |
+| `email` | Exact match; must be a valid email address |
+| `role` | `CUSTOMER` or `ADMIN` |
+| `name` | Case-insensitive substring match |
+
+**Sort** (`UserSortInput`)
+
+- `field`: `NAME`, `EMAIL`, `CREATED_AT`, or `UPDATED_AT`
+- `direction`: `ASC` or `DESC`
+- Default: `CREATED_AT DESC`
+- `id` is always added as a secondary sort key, so rows with equal sort values keep a stable order across pages.
+
+**Pagination** (`UserPaginationInput`)
+
+- `first`: page size, from 1 to 100 (default 20)
+- `after`: the `endCursor` from the previous page
+
+Pagination uses keysets (cursors), not offsets. A cursor is an opaque base64url string that encodes the sort field, the direction, the last item's sort value, and its `id`. To get the next page, send the same `filter` and `sort` with `after: <endCursor>`, and keep going while `pageInfo.hasNextPage` is `true`. `total` counts every user that matches the filter, ignoring the cursor. If a cursor is malformed, the query fails with `Invalid cursor`.
+
+> If you change `sort`, start again from the first page. A cursor only works with the sort that produced it.
 
 ## Configuration
 
-The referenced conversation provided this development example:
+Create `services/user-service/.env`:
 
 ```env
 PORT=4001
 NODE_ENV=development
 DATABASE_URL="postgresql://orderflow:orderflow@localhost:5432/orderflow?schema=public"
 JWT_SECRET="replace-with-a-long-random-secret"
-JWT_EXPIRES_IN="1h"
 ```
 
-Use a unique, high-entropy secret outside development and supply it via a secret manager or protected environment configuration. Do not commit a populated `.env` file. Confirm whether all listed variables are consumed by the current service code.
+If `JWT_SECRET` is not set, login and token verification throw. Outside development, use a unique, high-entropy secret supplied through a secret manager. Do not commit a populated `.env` file.
 
 ## PostgreSQL and Prisma
 
-The service is described as using a Docker PostgreSQL database and Prisma. The example URL targets a database named `orderflow` on `localhost:5432`, with user/password `orderflow`. The actual Compose filename, container/service name, Prisma schema path, generated-client command, and migration scripts were not available for inspection.
+The repository root contains `docker-compose.yml`, which runs a `postgres:16` container named `orderflow-postgres` on port `5432`. Its user, password, and database are all `orderflow`.
 
-Use the repository's documented Compose configuration to start the database, then apply migrations using the scripts defined in the service's `package.json`. Do not assume a particular migration command until the package scripts have been checked.
+```sh
+# from the repository root
+docker compose up -d
+
+# from services/user-service
+npm install
+npx prisma migrate dev
+```
+
+The Prisma schema is in `prisma/schema.prisma`. The `User` model maps to the `users` table and has these fields: `id` (UUID), `name`, `email` (unique), `passwordHash`, `role` (default `CUSTOMER`), `createdAt`, and `updatedAt`.
 
 ## Project structure
 
-The conversation references a modular user implementation with these source modules:
-
 ```text
-src/
-  modules/
-    user/
-      user.auth.ts        # JWT generation and verification
-      user.service.ts     # registration/login business logic
-      user.repository.ts  # persistence access
-      user.schema.ts      # registration validation/types
+services/user-service/
+  prisma/
+    schema.prisma
+    migrations/
+  src/
+    app.ts                  # Express app, /health, /graphql
+    server.ts               # bootstrap, DB connect, graceful shutdown
+    config/
+      database.ts           # Prisma client and connect/disconnect
+    graphql/
+      schema.ts             # GraphQL SDL
+      resolvers.ts          # Query/Mutation resolvers
+      context.ts            # Bearer token -> context.user
+    modules/user/
+      user.auth.ts          # JWT sign/verify
+      user.service.ts       # business logic (register, login, getById, getMany)
+      user.repository.ts    # Prisma access, filtering, sorting, keyset pagination
+      user.schema.ts        # Zod schemas: register, filter, sort, pagination
+      user.cursor.ts        # cursor encode/decode
+      user.pagination.ts    # pagination/connection types
 ```
-
-It also describes GraphQL schema/resolvers, an authentication context, application/server setup, and Prisma configuration. Their exact paths and filenames could not be confirmed, so this is a conceptual outline, not a verified complete tree.
 
 ## Commands
 
-The exact command captured in the referenced work is:
+Run these from `services/user-service`:
 
-```sh
-npm run typecheck
-```
-
-This runs `tsc --noEmit`. The development, build, start, migration, and database commands are package-specific and should be read from the current `package.json` and repository Compose file.
+| Command | Description |
+|---|---|
+| `npm run dev` | Start with hot reload (`tsx watch src/server.ts`) |
+| `npm run build` | Compile TypeScript to `dist/` |
+| `npm start` | Run the compiled server (`node dist/server.js`) |
+| `npm run typecheck` | Type-check without emitting (`tsc --noEmit`) |
 
 ## Security and operational guidance
 
-- Hash passwords with the configured password-hashing library and never expose hashes in GraphQL selections or logs.
-- Validate decoded JWT claims before using them. The implementation discussion specifically corrected an unchecked payload cast by validating `userId` and the role claim.
-- Treat JWT claims as identity information, not a replacement for authorization checks on each protected action.
-- Use HTTPS and protect bearer tokens from browser storage/logging exposure.
-- Keep production secrets out of Git and rotate compromised secrets.
-- Apply rate limits and generic failure messages to login/registration as appropriate.
-- Ensure Prisma errors and database internals are not returned to clients.
+- **`user` and `users` do not check authentication or authorization yet.** Anyone who can reach the endpoint can read every user's name, email, and role. Add auth checks before exposing these queries; `users` is a likely candidate for `ADMIN`-only access.
+- Passwords are hashed with bcrypt. `passwordHash` is not part of the GraphQL `User` type.
+- Decoded JWT claims are checked (`userId` must be a string, and `role` must be a known value) before they are used.
+- JWT claims prove identity. They do not replace authorization checks on each protected action.
+- Use HTTPS, and keep bearer tokens out of logs and insecure browser storage.
+- Add rate limits and generic failure messages for login and registration.
+- Make sure Prisma errors and database internals are never returned to clients.
 
 ## Troubleshooting
 
 | Issue | What to check |
 |---|---|
-| Startup fails due to missing JWT secret | Configure `JWT_SECRET`; the described helper throws if the value is missing. |
-| `me` returns an authentication error | Check the Bearer header, token expiration, signing secret, and context verification path. |
-| PostgreSQL connection error | Check the database container, port, credentials, database name, and `DATABASE_URL`. |
-| Missing relation/table | Apply the project's Prisma migrations and confirm the correct schema/database. |
-| TypeScript JWT overload error | Ensure the secret is narrowed to a definite string and decoded claims are validated before constructing the typed payload. |
-| GraphQL field/argument validation error | Compare the operation with the actual SDL; examples here were reconstructed without the service files. |
+| Login fails with `JWT_SECRET is not configured` | Set `JWT_SECRET` in `.env`. |
+| `me` returns `Authentication required` | Check the `Authorization: Bearer <token>` header, whether the token has expired (1 hour), and that the same `JWT_SECRET` signed it. |
+| `users` returns `Invalid cursor` | Pass the `endCursor` from a previous response unchanged. |
+| `users` pages skip or repeat items | Send the same `sort` with every page request, and start over if you change it. |
+| Validation error on `users` input | `filter.id` must be a UUID, `filter.email` must be a valid email, and `first` must be between 1 and 100. |
+| PostgreSQL connection error | Check that `orderflow-postgres` is running and that `DATABASE_URL` matches the compose credentials. |
+| Missing relation/table | Run `npx prisma migrate dev`. |
 
 ## Next steps
 
-1. Verify this documentation against `package.json`, Prisma schema/migrations, SDL, resolvers, auth context, and Docker configuration.
-2. Add tests for registration validation, password hashing, login failure/success, JWT claim validation, and authenticated `me` behavior.
-3. Add explicit authorization rules for role-sensitive operations.
-4. Integrate the User Service with the planned Order Service and Gateway, with clear token-verification and service-to-service boundaries.
+1. Add authentication and role-based authorization to `user` and `users`.
+2. Reject cursors whose sort field or direction does not match the current `sort`.
+3. Add tests for registration, login, JWT validation, `me`, filtering, sorting, and pagination across pages.
+4. Read the token lifetime from configuration instead of hard-coding it.
+5. Integrate with the planned Order Service and Gateway.
